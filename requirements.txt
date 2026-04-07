@@ -3,4 +3,6 @@ openai-whisper
 pypdf
 python-docx
 scikit-learn
+streamlit-webrtc
+av
 torch
