@@ -5,15 +5,16 @@ if exist .venv (
   call .venv\Scripts\activate
 )
 
-pyinstaller ^
+python -m PyInstaller ^
   --noconfirm ^
   --clean ^
   --name ManualAuditAssistant ^
   --onedir ^
   --add-data "app.py;." ^
-  --add-data ".streamlit;.streamlit" ^
   run_app.py
 
-echo.
+if errorlevel 1 exit /b 1
+if not exist dist\ManualAuditAssistant exit /b 1
+
 echo Build tamamlandi. Cikti klasoru: dist\ManualAuditAssistant
-pause
+dir dist
