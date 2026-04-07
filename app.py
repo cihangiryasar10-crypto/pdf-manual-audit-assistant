@@ -6,14 +6,17 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List
 
+import av
 import streamlit as st
 import whisper
 from docx import Document
 from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import linear_kernel
+from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
 
 @dataclass
@@ -24,11 +27,41 @@ class Chunk:
     text: str
 
 
+@dataclass
+class LocalDocument:
+    name: str
+    content: bytes
+
+
+STOP_WORDS = {
+    "the", "a", "an", "for", "to", "of", "in", "on", "and", "or", "is", "are",
+    "what", "how", "when", "where", "show", "give", "need", "about", "before",
+    "after", "with", "from", "into", "procedure", "procedures", "step", "steps",
+    "manual", "manuals", "please", "find", "tell", "me",
+}
+
+PROCEDURE_TERMS = {
+    "procedure", "procedures", "step", "steps", "test", "testing", "check",
+    "checks", "inspection", "inspect", "method", "operation", "operational",
+    "startup", "shutdown", "pre-operational", "preoperational", "checklist",
+    "instructions", "verification",
+}
+
+GENERIC_TERMS = {
+    "description", "overview", "general", "introduction", "scope", "purpose",
+    "background", "summary", "definitions",
+}
+
+
 def normalize_text(value: str) -> str:
     value = value.replace("\x00", " ")
     value = re.sub(r"[ \t]+", " ", value)
     value = re.sub(r"\n{3,}", "\n\n", value)
     return value.strip()
+
+
+def slug_terms(value: str) -> List[str]:
+    return [term for term in re.findall(r"[a-z0-9][a-z0-9\-]+", value.lower()) if term]
 
 
 def is_heading(line: str) -> bool:
@@ -132,41 +165,71 @@ def load_docx_text(file_bytes: bytes) -> str:
     return "\n".join(paragraphs)
 
 
+def extract_chunks_from_file(name: str, file_bytes: bytes) -> List[Chunk]:
+    file_name = name.lower()
+    chunks: List[Chunk] = []
+
+    if file_name.endswith(".pdf"):
+        reader = PdfReader(io.BytesIO(file_bytes))
+        for page_index, page in enumerate(reader.pages, start=1):
+            page_text = page.extract_text() or ""
+            chunks.extend(
+                split_page_into_chunks(
+                    source_name=name,
+                    page_number=page_index,
+                    page_text=page_text,
+                )
+            )
+    elif file_name.endswith(".docx"):
+        docx_text = load_docx_text(file_bytes)
+        chunks.extend(
+            split_document_text_into_chunks(
+                source_name=name,
+                text=docx_text,
+            )
+        )
+
+    return chunks
+
+
 def load_document_chunks(uploaded_files) -> List[Chunk]:
     all_chunks: List[Chunk] = []
     for uploaded_file in uploaded_files:
-        file_bytes = uploaded_file.getvalue()
-        file_name = uploaded_file.name.lower()
-
-        if file_name.endswith(".pdf"):
-            reader = PdfReader(io.BytesIO(file_bytes))
-            for page_index, page in enumerate(reader.pages, start=1):
-                page_text = page.extract_text() or ""
-                all_chunks.extend(
-                    split_page_into_chunks(
-                        source_name=uploaded_file.name,
-                        page_number=page_index,
-                        page_text=page_text,
-                    )
-                )
-        elif file_name.endswith(".docx"):
-            docx_text = load_docx_text(file_bytes)
-            all_chunks.extend(
-                split_document_text_into_chunks(
-                    source_name=uploaded_file.name,
-                    text=docx_text,
-                )
-            )
+        if hasattr(uploaded_file, "getvalue"):
+            content = uploaded_file.getvalue()
+        else:
+            content = uploaded_file.content
+        all_chunks.extend(extract_chunks_from_file(uploaded_file.name, content))
 
     return [chunk for chunk in all_chunks if chunk.text.strip()]
+
+
+def load_local_default_documents() -> List[LocalDocument]:
+    default_dir = Path(__file__).with_name("default_manuals")
+    if not default_dir.exists():
+        return []
+
+    documents: List[LocalDocument] = []
+    for path in sorted(default_dir.iterdir()):
+        if path.is_file() and path.suffix.lower() in {".pdf", ".docx"}:
+            documents.append(LocalDocument(name=path.name, content=path.read_bytes()))
+    return documents
 
 
 def fingerprint_files(uploaded_files) -> str:
     digest = hashlib.sha256()
     for uploaded_file in uploaded_files:
-        digest.update(uploaded_file.name.encode("utf-8"))
-        digest.update(str(uploaded_file.size).encode("utf-8"))
-        digest.update(uploaded_file.getvalue())
+        name = uploaded_file.name
+        if hasattr(uploaded_file, "getvalue"):
+            content = uploaded_file.getvalue()
+            size = getattr(uploaded_file, "size", len(content))
+        else:
+            content = uploaded_file.content
+            size = len(content)
+
+        digest.update(name.encode("utf-8"))
+        digest.update(str(size).encode("utf-8"))
+        digest.update(content)
     return digest.hexdigest()
 
 
@@ -203,11 +266,51 @@ def search_chunks(question: str, vectorizer, matrix, chunks: List[Chunk], top_k:
     scores = linear_kernel(query_vector, matrix).flatten()
     ranked_indices = scores.argsort()[::-1]
 
-    results = []
-    for idx in ranked_indices[:top_k]:
-        if scores[idx] <= 0:
+    quoted_phrases = [match.strip() for match in re.findall(r'"([^"]+)"', question.lower()) if match.strip()]
+    capitalized_phrases = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b", question)
+    detected_phrases = quoted_phrases + [phrase.lower() for phrase in capitalized_phrases]
+    query_terms = [term for term in slug_terms(question) if term not in STOP_WORDS and len(term) > 2]
+    important_terms = [term for term in query_terms if term not in PROCEDURE_TERMS]
+
+    rescored = []
+    for idx in ranked_indices[: min(len(chunks), 20)]:
+        base_score = float(scores[idx])
+        if base_score <= 0:
             continue
-        results.append((chunks[idx], float(scores[idx])))
+
+        chunk = chunks[idx]
+        haystack = f"{chunk.heading}\n{chunk.text}".lower()
+        heading = chunk.heading.lower()
+        score = base_score
+
+        procedure_boost = sum(1 for term in PROCEDURE_TERMS if term in heading) * 0.12
+        score += procedure_boost
+
+        generic_penalty = sum(1 for term in GENERIC_TERMS if term in heading) * 0.06
+        score -= generic_penalty
+
+        phrase_hits = 0
+        for phrase in detected_phrases:
+            if len(phrase.split()) >= 2 and phrase in haystack:
+                phrase_hits += 1
+        score += phrase_hits * 0.35
+
+        term_hits = sum(1 for term in important_terms if term in haystack)
+        if important_terms:
+            coverage = term_hits / max(len(important_terms), 1)
+            score += coverage * 0.45
+
+        if any(term in heading for term in {"test", "procedure", "steps", "inspection", "check"}):
+            score += 0.15
+
+        rescored.append((chunk, score))
+
+    rescored.sort(key=lambda item: item[1], reverse=True)
+    results = []
+    for chunk, score in rescored[:top_k]:
+        if score <= 0:
+            continue
+        results.append((chunk, score))
     return results
 
 
@@ -218,10 +321,57 @@ def ensure_session_defaults() -> None:
         "vectorizer": None,
         "matrix": None,
         "transcript": "",
+        "live_transcript": "",
+        "live_audio_buffer": bytearray(),
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+def append_audio_frames_to_buffer(frames: List[av.AudioFrame]) -> None:
+    if not frames:
+        return
+
+    with io.BytesIO() as wav_buffer:
+        import wave
+
+        first = frames[0].to_ndarray()
+        sample_rate = frames[0].sample_rate
+        channels = 1 if first.ndim == 1 else first.shape[0]
+
+        with wave.open(wav_buffer, "wb") as wav_file:
+            wav_file.setnchannels(channels)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+
+            for frame in frames:
+                array = frame.to_ndarray()
+                if array.ndim > 1:
+                    array = array.T
+                wav_file.writeframes(array.astype("int16").tobytes())
+
+        st.session_state.live_audio_buffer.extend(wav_buffer.getvalue())
+
+
+def process_live_audio_if_available(ctx, model_name: str) -> None:
+    if not ctx or not ctx.state.playing or not ctx.audio_receiver:
+        return
+
+    try:
+        frames = ctx.audio_receiver.get_frames(timeout=0.2)
+    except Exception:
+        frames = []
+
+    if not frames:
+        return
+
+    append_audio_frames_to_buffer(frames)
+
+    if len(st.session_state.live_audio_buffer) > 240000:
+        transcript = transcribe_audio_bytes(bytes(st.session_state.live_audio_buffer), model_name)
+        if transcript:
+            st.session_state.live_transcript = transcript
 
 
 def index_manuals(uploaded_files) -> None:
@@ -381,6 +531,8 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
+    default_documents = load_local_default_documents()
+
     with st.sidebar:
         st.header("Ayarlar")
         whisper_model_name = st.selectbox(
@@ -390,6 +542,23 @@ def main() -> None:
             help="base.en CPU icin daha hafif, medium.en daha dogru ama daha yavas olabilir.",
         )
         st.caption("Whisper icin sisteminizde ffmpeg kurulu olmali.")
+        listening_mode = st.radio(
+            "Dinleme modu",
+            options=["Kayit modu", "Canli dinleme"],
+            index=0,
+            help="Canli dinleme tarayicidan mikrofon akisini baslatir.",
+        )
+        use_default_docs = st.toggle(
+            "Varsayilan manuelleri kullan",
+            value=bool(default_documents),
+            disabled=not bool(default_documents),
+            help="Repo icindeki default_manuals klasorundeki PDF ve Word dosyalarini otomatik kullanir.",
+        )
+        if default_documents:
+            st.caption(f"Hazir dokuman sayisi: {len(default_documents)}")
+        else:
+            st.caption("Varsayilan manuel yok. default_manuals klasorune PDF veya DOCX ekleyebilirsiniz.")
+        st.caption("Arama motoru prosedur ve test odakli yeniden siralama ile guclendirildi.")
 
     uploaded_files = st.file_uploader(
         "PDF veya Word manuellerini yukleyin",
@@ -397,13 +566,17 @@ def main() -> None:
         accept_multiple_files=True,
     )
 
-    if uploaded_files:
-        current_fingerprint = fingerprint_files(uploaded_files)
+    selected_documents = list(uploaded_files) if uploaded_files else []
+    if use_default_docs and default_documents:
+        selected_documents.extend(default_documents)
+
+    if selected_documents:
+        current_fingerprint = fingerprint_files(selected_documents)
         if st.session_state.manual_fingerprint != current_fingerprint:
             try:
                 with st.spinner("Dosyalar indeksleniyor..."):
-                    index_manuals(uploaded_files)
-                st.success(f"{len(uploaded_files)} dosya islendi, arama icin hazir.")
+                    index_manuals(selected_documents)
+                st.success(f"{len(selected_documents)} dosya islendi, arama icin hazir.")
             except Exception as exc:
                 st.session_state.manual_fingerprint = None
                 st.session_state.chunks = []
@@ -418,22 +591,40 @@ def main() -> None:
     with col1:
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.subheader("1. Mikrofonu dinle")
-        audio_file = st.audio_input(
-            "Ingilizce soruyu kaydedin",
-            sample_rate=16000,
-            help="Tarayici mikrofon izni isteyecektir. Kayit WAV olarak alinir.",
-        )
+        if listening_mode == "Kayit modu":
+            audio_file = st.audio_input(
+                "Ingilizce soruyu kaydedin",
+                sample_rate=16000,
+                help="Tarayici mikrofon izni isteyecektir. Kayit WAV olarak alinir.",
+            )
 
-        if audio_file is not None:
-            st.audio(audio_file)
-            if st.button("Konusmayi metne cevir", type="primary", use_container_width=True):
-                with st.spinner("Whisper ile metne cevriliyor..."):
-                    transcript = transcribe_audio_bytes(audio_file.getvalue(), whisper_model_name)
-                st.session_state.transcript = transcript
+            if audio_file is not None:
+                st.audio(audio_file)
+                if st.button("Konusmayi metne cevir", type="primary", use_container_width=True):
+                    with st.spinner("Whisper ile metne cevriliyor..."):
+                        transcript = transcribe_audio_bytes(audio_file.getvalue(), whisper_model_name)
+                    st.session_state.transcript = transcript
+        else:
+            live_ctx = webrtc_streamer(
+                key="live-audio",
+                mode=WebRtcMode.SENDONLY,
+                media_stream_constraints={"video": False, "audio": True},
+                rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+                audio_receiver_size=256,
+            )
+            process_live_audio_if_available(live_ctx, whisper_model_name)
+            st.caption("START ile mikrofon akisina baslayin. Akis geldikce transkript guncellenir.")
+            if st.button("Canli transkripti temizle", use_container_width=True):
+                st.session_state.live_audio_buffer = bytearray()
+                st.session_state.live_transcript = ""
+            if st.session_state.live_transcript:
+                st.markdown("### Canli transkript")
+                st.write(st.session_state.live_transcript)
 
+        current_question = st.session_state.live_transcript or st.session_state.transcript
         question_text = st.text_area(
             "2. Denetci sorusu",
-            value=st.session_state.transcript,
+            value=current_question,
             height=180,
             placeholder="Orn: What is the inspection procedure before restarting the pump?",
         )
